@@ -131,7 +131,7 @@ def add_to_agent(sts_integration: ADKTokenPropagationPlugin, agent: BaseAgent):
 
 @app.command()
 def run(
-    name: Annotated[str, typer.Argument(help="The name of the agent to run")],
+    name: Annotated[Optional[str], typer.Argument(help="The name of the agent to run")] = None,
     working_dir: str = ".",
     host: str = "127.0.0.1",
     port: int = 8080,
@@ -139,13 +139,62 @@ def run(
     local: Annotated[
         bool, typer.Option("--local", help="Run with in-memory session service (for local development)")
     ] = False,
+    filepath: Annotated[
+        str, typer.Option("--filepath", help="Load agent from config.json + agent-card.json at this path")
+    ] = "",
 ):
+    if not filepath and not name:
+        raise typer.BadParameter("Either NAME argument or --filepath option is required")
+
     app_cfg = KAgentConfig()
 
     plugins = None
     sts_integration = create_sts_integration()
     if sts_integration:
         plugins = [sts_integration]
+
+    if filepath:
+        # Load from controller-generated config files
+        with open(os.path.join(filepath, "config.json"), "r") as f:
+            config = json.load(f)
+        agent_config = AgentConfig.model_validate(config)
+        with open(os.path.join(filepath, "agent-card.json"), "r") as f:
+            agent_card = json.load(f)
+        agent_card = AgentCard.model_validate(agent_card)
+
+        if agent_config.model.api_key_passthrough:
+            from ._llm_passthrough_plugin import LLMPassthroughPlugin
+
+            if plugins is None:
+                plugins = []
+            plugins.append(LLMPassthroughPlugin())
+
+        def root_agent_factory() -> BaseAgent:
+            root_agent = agent_config.to_agent(app_cfg.name, sts_integration)
+            maybe_add_skills_with_config(root_agent, agent_config)
+            return root_agent
+
+        kagent_app = KAgentApp(
+            root_agent_factory,
+            agent_card,
+            app_cfg.url,
+            app_cfg.app_name,
+            plugins=plugins,
+            stream=agent_config.stream if agent_config.stream is not None else False,
+            agent_config=agent_config,
+        )
+
+        server = kagent_app.build()
+        configure_tracing(app_cfg.name, app_cfg.namespace, server)
+
+        uvicorn.run(
+            server,
+            host=host,
+            port=port,
+            workers=workers,
+            log_level=uvicorn_log_level,
+        )
+        return
 
     agent_loader = AgentLoader(agents_dir=working_dir)
 
